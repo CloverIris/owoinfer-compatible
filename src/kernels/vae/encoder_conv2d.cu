@@ -136,9 +136,10 @@ void check_cutlass(cutlass::Status st, const char* op, const char* what) {
     throw std::runtime_error(std::string(op) + ": CUTLASS " + what + " failed: " + cutlassGetStatusString(st));
 }
 
-template <typename Cfg>
-void run(const char* name, const Shape& s, const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual,
-         const Tensor& y, void* workspace, std::size_t workspace_bytes, cudaStream_t stream) {
+// The operand rules every path shares (the CUTLASS kernels and the sm_7x SIMT ones, which load bias and residual as
+// float4).
+void check_operands(const char* name, const Shape& s, const Tensor& x, const Tensor& w, const Tensor& bias,
+                    const Tensor* residual, const Tensor& y) {
   require(bias.dtype == DType::kF32 && bias.numel() == s.k && bias.device == Device::kCUDA,
           std::string(name) + ": bias must be f32 [K] on CUDA");
   if (residual)
@@ -152,6 +153,12 @@ void run(const char* name, const Shape& s, const Tensor& x, const Tensor& w, con
           std::string(name) + ": x/w/y/residual need 16-byte and bias 32-byte alignment");
   require(x.nbytes() < (std::size_t{1} << 31) && y.nbytes() < (std::size_t{1} << 31),
           std::string(name) + ": tensors must be smaller than 2 GiB (CUTLASS 32-bit offsets)");
+}
+
+template <typename Cfg>
+void run(const char* name, const Shape& s, const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual,
+         const Tensor& y, void* workspace, std::size_t workspace_bytes, cudaStream_t stream) {
+  check_operands(name, s, x, w, bias, residual, y);
   auto args = make_args<Cfg>(s, x, w, bias, residual, y);
   check_cutlass(Cfg::Op::can_implement(args), name, "can_implement");
   require(Cfg::Op::get_workspace_size(args) <= workspace_bytes, std::string(name) + ": workspace too small");
@@ -172,9 +179,9 @@ std::size_t encoder_conv2d_workspace_bytes(const Tensor& x, const Tensor& w, Con
 
 void encoder_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual, const Tensor& y,
                     void* workspace, std::size_t workspace_bytes, ConvMath math, cudaStream_t stream) {
-  if (kernels::sm75::turing()) {  // fp32 SIMT conv: Turing has no tensor cores for this path
-    check("encoder_conv2d", x, w, y, 1);
-    kernels::sm75::vae_conv2d(x, w, bias, residual, y, stream);
+  if (kernels::sm75::turing()) {  // sm_7x: the decoder's fp32 SIMT conv (conv2d dispatches Turing and Volta)
+    check_operands("encoder_conv2d", check("encoder_conv2d", x, w, y, 1), x, w, bias, residual, y);
+    conv2d(x, w, bias, residual, y, workspace, workspace_bytes, stream);
     return;
   }
   if (math == ConvMath::kTf32) {
@@ -193,8 +200,8 @@ std::size_t conv2d_down_workspace_bytes(const Tensor& x, const Tensor& w, const 
 
 void conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor& y, void* workspace,
                  std::size_t workspace_bytes, ConvMath math, cudaStream_t stream) {
-  if (kernels::sm75::turing()) {
-    check("conv2d_down", x, w, y, 2);
+  if (kernels::sm75::turing()) {  // sm_7x: fp32 SIMT (kernels/sm75/vae_sm75.cu, also built for sm_70)
+    check_operands("conv2d_down", check("conv2d_down", x, w, y, 2), x, w, bias, nullptr, y);
     kernels::sm75::vae_conv2d_down(x, w, bias, y, stream);
     return;
   }

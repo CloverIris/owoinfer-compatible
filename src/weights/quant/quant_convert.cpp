@@ -860,7 +860,7 @@ ConvertStats convert(const fs::path& input, const fs::path& output, const Conver
   std::map<std::string, int> spec_counts;  // describe(spec) -> GEMMs written with it
   for (OutModule& om : mods) {
     om.scale = om.scale_2 = om.config = om.bias = kNone;
-    spec_counts[describe(om.spec)] += static_cast<int>(om.parts.size());
+    spec_counts[om.int4 ? std::string("convrot_w4a4 g256") : describe(om.spec)] += static_cast<int>(om.parts.size());
     if (om.int4) {
       if (om.k % 256 != 0) fail("'" + om.name + "': K=" + std::to_string(om.k) + " is not a multiple of 256, which convrot_w4a4 needs");
       om.weight = add(om.name + ".weight", DType::kI8, {om.n, om.k / 2});

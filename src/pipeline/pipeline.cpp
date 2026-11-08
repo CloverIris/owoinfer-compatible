@@ -938,11 +938,16 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // Quality tier from what is loaded, before anything heavy (its refusals throw std::invalid_argument here, ahead of
     // the LoRA files too). The lossy accelerators are an explicit speed opt-in: the tier is resolved without them.
     const std::filesystem::path te_file = tes.model ? tes.path : std::filesystem::path();
-    const auto supported = [](planner::AttentionMode mode) { return moss_dit::attention_supported(dit_attention(mode)); };
-    // sm_75: no 8-bit attention kernel exists for Turing, so the caller's unset attention resolves to exact instead of
-    // failing. Keyed on the device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY)
-    // still refuses, as before.
+    // sm_7x: the caller's unset attention resolves to exact instead of an 8-bit default. Volta has no 8-bit attention
+    // kernel; Turing's q8_fp16 (kernels/sm75/attention_q8_sm75.cu) runs when asked for, but is no faster than exact
+    // there (Turing's INT8 MMA does the fp16 MMA's MACs per instruction), so it is never the default. Keyed on the
+    // device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY) still refuses, as before.
     const bool exact_when_no_q8 = kernels::sm75::turing();
+    const bool attention_given = m.options.attention.has_value();
+    const auto supported = [&](planner::AttentionMode mode) {
+      if (exact_when_no_q8 && !attention_given && planner::is_q8(mode)) return false;
+      return moss_dit::attention_supported(dit_attention(mode));
+    };
     // sm_75 has no LoRA side-branch kernels, so run() forces every adapter to merge (Pipeline::run, above); INT4
     // ConvRot weights have no merge path (merges need bf16 or INT8 ConvRot), and the tier's own advice ("use
     // lora_placement side_branch") does not exist on Turing: refuse here with what does work.
@@ -1071,12 +1076,8 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
         // A model merged without pristine copies (an edit adapter's blocks) is reloaded instead (its key cleared).
         if (m.dit && m.dit_merge_key == files && !m.dit->can_remerge()) m.dit_merge_key.clear();
-        if (kernels::sm75::turing() && !m.lora_stack->merge_modules().empty()) {
-          // The merge is in bf16 at load, and the weights are converted to fp16 afterwards: re-merging in place would
-          // mix the two, so drop the DiT and let the next call reload (its load re-merges, then re-converts).
-          m.dit_merge_key.clear();
-          m.dit.reset();
-        } else if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
+        // On sm_7x the re-merge converts the rewritten resident weights back to fp16 (MossDit::remerge_lora).
+        if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
           const auto t0m = Clock::now();
           try {
             m.dit->remerge_lora(*m.lora_stack);
@@ -1517,6 +1518,11 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
 // Pipeline::run, and by a Session for its options and every run's spec): control adapters (a LoRA with a replacement
 // embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT), and runtime LoRAs are merged at
 // load (Pipeline::run sets the placement).
+void detail::force_lora_merge_on_sm7x(Request& req) {
+  // The load-time merge runs in bf16 and the fp16 conversion follows it, as for the bf16 bundle.
+  if (kernels::sm75::turing() && !req.loras.empty()) req.lora_placement = lora::Placement::kMerge;
+}
+
 void detail::refuse_unsupported_on_sm7x(const Request& req) {
   if (!kernels::sm75::turing()) return;
   // The VAE encoder runs on Turing (fp32 SIMT convs, the same kernels as the decoder), so img2img, inpainting,
@@ -1530,11 +1536,7 @@ void detail::refuse_unsupported_on_sm7x(const Request& req) {
 Result Pipeline::run(const Request& request, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
   Request req = request;
-  // Turing has no fused LoRA side-branch kernels (sm_80+ CUTLASS), so a runtime LoRA is merged into the weights at
-  // load instead (its load-time merge then feeds the fp16 conversion the same way as the bf16 bundle).
-  if (kernels::sm75::turing() && !req.loras.empty() && req.lora_placement != lora::Placement::kMerge) {
-    req.lora_placement = lora::Placement::kMerge;
-  }
+  force_lora_merge_on_sm7x(req);
   check_user_paths(m.options, req);
   validate(req);
   refuse_unsupported_on_sm7x(req);
