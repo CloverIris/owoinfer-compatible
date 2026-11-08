@@ -1,4 +1,5 @@
 #include "kernels/attention_q8/attention_q8.h"
+#include "kernels/sm75/sm75.h"
 
 #include <algorithm>
 #include <array>
@@ -166,6 +167,8 @@ double e4m3_rn(double x) {
 }  // namespace
 
 bool supported(Variant v) {
+  // sm_75 has its own INT8-QK kernel (kernels/sm75/attention_q8_sm75.cu) for the fp16-accumulation variants.
+  if (kernels::sm75::turing()) return v == Variant::kInt8Fp16 || v == Variant::kInt8Fp16F32Acc;
   int device = 0;
   MI_CUDA_CHECK(cudaGetDevice(&device));
   return support(device, v) == Support::kOk;
@@ -195,12 +198,26 @@ float effective_v_range(const Options& o) {
 
 std::size_t attention_q8_workspace_bytes(const Options& o, std::int64_t total_q, std::int64_t total_k, int batch,
                                          int max_seqlen, int num_heads, int num_kv_heads) {
+  if (kernels::sm75::turing()) return kernels::sm75::q8_workspace_bytes(total_q, total_k, num_heads, num_kv_heads);
   return layout(o.variant, total_q, total_k, batch, max_seqlen, num_heads, num_kv_heads).total;
 }
 
 void attention_q8(const Options& o, const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out,
                   const Tensor& cu_seqlens_q, const Tensor& cu_seqlens_k, int max_seqlen, float scale, void* workspace,
                   std::size_t workspace_bytes, cudaStream_t stream, const QkNormRope* norm_rope) {
+  if (kernels::sm75::turing()) {
+    if (o.variant != Variant::kInt8Fp16 && o.variant != Variant::kInt8Fp16F32Acc) {
+      throw std::runtime_error("attention_q8: the sm_75 build runs the fp16-accumulation variants only");
+    }
+    if (norm_rope != nullptr) {
+      throw std::invalid_argument(
+          "attention_q8: the sm_75 build has no fused norm/rope pre-pass; run qk_norm_rope_moss first");
+    }
+    check_qkvo(q, "q");
+    kernels::sm75::q8_flash_fwd(q, k, v, out, cu_seqlens_q, cu_seqlens_k, max_seqlen, scale, workspace, workspace_bytes,
+                                stream);
+    return;
+  }
   check_qkvo(q, "q");
   check_qkvo(k, "k");
   check_qkvo(v, "v");

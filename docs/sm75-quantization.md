@@ -54,9 +54,15 @@ multiple of 256.
 sm_75 has no 8-bit attention, so the resolver falls back to exact attention and then refuses the combination. A
 Turing user has to quantize the DiT first (or download an INT8 file) to use `high`.
 
-**G3 - no 8-bit attention kernel.** `q8_fp16`/`q8_fp8` are refused on sm_75 `--attention`. Besides blocking G2, this
-is the mainline's long-sequence accelerator: at 1024^2 the DiT's exact attention is 1.05 s per step
-(7.3 TFLOPS with the new kernel), which an INT8 QK mainloop should roughly halve.
+**G3 - 8-bit attention (done, P2).** `src/kernels/sm75/attention_q8_sm75.cu` implements `q8_fp16` on Turing:
+per-row INT8 q/k (a `q8_quantize_rows` pre-pass, v converted to fp16), QK^T with the m8n8k16 INT8 MMA, the exact
+kernel's fp32 online softmax and fp16 P·V. It is wired through `attention_q8.cu`'s three entry points, so
+`tier high` now runs on a **bf16 DiT** (`tier high: DiT bf16, q8_fp16 attention`) — verified on the RTX 2080 at
+256^2 (output cosine 0.9986 against the exact path) and 1024^2. Speed: at 256^2 and 1024^2 it is within noise of the
+exact path (0.96 vs 0.94 s/step; 4.39 vs 4.30 s/step), because Turing's INT8 MMA (`m8n8k16`) does the same MACs per
+instruction as the fp16 `m16n8k8` it replaces — Ampere's `m16n8k32` is what doubles INT8 throughput, and Turing does not
+have it. The 8-bit mode is therefore a memory-footprint/bandwidth path on Turing, not a compute accelerator;
+`q8_fp8` stays refused (no e4m3 MMA).
 
 **G4 - LoRA on quantized DiTs (done, P4).** On sm_75 every adapter is merged (the side branches are sm_80+ kernels).
 Verified on the RTX 2080: `reference + --lora` merges into bf16; `high + --lora` merges into the INT8 ConvRot weights
@@ -73,11 +79,11 @@ one is loaded.
 **P1 - INT4 output in `quantize` (done).** `--format int4 --recipe mse|rtn` writes a `convrot_w4a4` DiT the same card
 can run with `--tier turbo`; the produced file is 2.83 GB and matches a published file's weights at cosine 0.9993.
 
-**P2 - Turing 8-bit attention (`q8_fp16`).** A new kernel in `src/kernels/sm75/`: INT8 QK with the Turing m8n8k16 MMA
-over the ConvRot-quantized q/k (the quantizers are already portable: `quant/rotate_quantize.cu`), fp16 P·V with the
-existing m16n8k8 MMA, exact softmax in fp32. Wire it into `attention_supported`, `MossDit`'s attention dispatch and
-`resolve_tier` so `--attention q8_fp16` is accepted on cc 7.5 and `high` with a bf16 DiT resolves to it. Expected:
-attention 14.3 ms -> 8-9 ms at 1024^2 (0.5 s per step saved) and `high` works without a quantized file.
+**P2 - Turing 8-bit attention (`q8_fp16`) (done).** `attention_q8_sm75.cu` (per-row INT8 q/k, m8n8k16 QK^T, the
+exact kernel's softmax and fp16 P·V) is wired into `attention_q8.cu`; `tier high` runs on a bf16 DiT and matches the
+exact path at cosine 0.9986. The expected 1.5-2x attention speedup did not materialize: Turing's INT8 MMA is
+`m8n8k16`, the same MACs per instruction as the fp16 `m16n8k8` it replaces (Ampere's `m16n8k32` is the 2x part), so
+8-bit attention is a bandwidth/footprint path on this architecture, not a compute one.
 
 **P2 design notes (from the code, for the implementation).** The whole 8-bit path funnels through three functions in
 `src/kernels/attention_q8/attention_q8.cu` (`supported`, `attention_q8_workspace_bytes`, `attention_q8`), so a Turing
