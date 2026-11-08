@@ -514,9 +514,13 @@ bool MossDit::rebase_merges(const lora::LoraStack* stack, const std::string& mem
     if (t.w.data == nullptr) return false;  // a block module: only a load can merge it
     added.emplace_back(module, t);
   }
-  // sm_7x: a module merged for the first time needs its pristine bf16 bits, but its resident weight already holds the
-  // load's fp16 conversion: only a load can merge it.
-  if (!added.empty() && kernels::sm75::fp16_weights()) return false;
+  // sm_7x: a module with no pristine copy yet would take it from its resident weight, which already holds the load's
+  // fp16 conversion: only a load can merge it. One the memo kept a copy of merges from that copy.
+  if (kernels::sm75::fp16_weights()) {
+    for (const auto& [module, t] : added) {
+      if (!pristine_ || !pristine_->has(module)) return false;
+    }
+  }
   MI_CUDA_CHECK(cudaDeviceSynchronize());  // no forward may read the weights while they change
   // Transactional: the pristine copies of the new modules and every module's new bits are computed into owned host
   // buffers first; a failure there (a non-finite merge, a bad factor, out of memory) drops the new copies and leaves the

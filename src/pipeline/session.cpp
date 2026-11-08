@@ -380,6 +380,7 @@ Session::Session(Pipeline& pipeline, JobGate& gate, SessionOptions options) {
   q.control.adapter = options.control_adapter;
   if (q.control.adapter.empty()) q.control.images.clear();
   if (tok::python_strip(q.prompt).empty()) q.prompt = "preload";
+  force_lora_merge_on_sm7x(q);  // the plan's models match the runs' (run_request)
   check_user_paths(pipeline.impl_->options, q);
   pipeline::validate(q);
   refuse_unsupported_on_sm7x(q);
