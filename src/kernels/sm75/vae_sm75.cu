@@ -128,47 +128,87 @@ __global__ void conv2d_f32_sm75(const float* __restrict__ x, const float* __rest
   }
 }
 // ---------------------------------------------------------------- mid-block attention (single head, fp32)
-// One warp per query row: the lane holds D/32 elements of q, v and the output; the score is a warp reduction and the
-// softmax runs online, so the L x L matrix never exists. D is a multiple of 32 (384 or 512).
-constexpr int kAttnWarps = 4;
+// One warp per row read K and V from global memory in full for every query row: at a 1024^2 latent (16384 tokens) that
+// is 8 TB of reads and 5.4 s on an RTX 2080. This version keeps 32 query rows per block in registers (four per warp)
+// and stages the K and V tiles once per block in shared memory, so every tile is read L/32 times instead of L times.
+// D is a multiple of 32 (384 or 512); the online softmax keeps the same key order, so the output bits are unchanged.
+constexpr int kAttnWarps = 8;
+constexpr int kAttnRowsPerWarp = 4;
+constexpr int kAttnRows = kAttnWarps * kAttnRowsPerWarp;  // 32 query rows per block
+constexpr int kAttnTile = 8;                              // keys per staged tile
 
-__global__ void attention_f32_sm75(const float* __restrict__ q, const float* __restrict__ k,
-                                   const float* __restrict__ v, float* __restrict__ o, int L, int D, int q_rows,
-                                   int k_rows, int v_rows, std::int64_t q_batch, std::int64_t k_batch,
-                                   std::int64_t v_batch, std::int64_t o_batch, float scale) {
+// LANES is D/32 at compile time, so the per-row register arrays keep their indices in registers; a runtime lane count
+// would place them in local memory and cost an order of magnitude.
+template <int LANES>
+__global__ void attention_f32_sm75_t(const float* __restrict__ q, const float* __restrict__ k,
+                                     const float* __restrict__ v, float* __restrict__ o, int L, int q_rows,
+                                     int k_rows, int v_rows, std::int64_t q_batch, std::int64_t k_batch,
+                                     std::int64_t v_batch, std::int64_t o_batch, float scale) {
+  constexpr int kD = LANES * 32;
+  extern __shared__ __align__(16) float smem[];
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  const int row = blockIdx.x * kAttnWarps + warp;
-  if (row >= L) return;
-  const int nlanes = D / 32;
+  const int tid = threadIdx.x;
   const int b = blockIdx.y;
-  const float* qrow = q + static_cast<std::int64_t>(b) * q_batch + static_cast<std::int64_t>(row) * q_rows;
-  float qreg[16];
-  float oacc[16];
-  for (int i = 0; i < nlanes; ++i) {
-    qreg[i] = qrow[lane + 32 * i];
-    oacc[i] = 0.f;
-  }
-  float m = -1e30f, s = 0.f;
-  for (int j = 0; j < L; ++j) {
-    const float* krow = k + static_cast<std::int64_t>(b) * k_batch + static_cast<std::int64_t>(j) * k_rows;
-    float dot = 0.f;
-    for (int i = 0; i < nlanes; ++i) dot += qreg[i] * krow[lane + 32 * i];
+  const int row0 = blockIdx.x * kAttnRows + warp * kAttnRowsPerWarp;
+  float qreg[kAttnRowsPerWarp][LANES];
+  float oacc[kAttnRowsPerWarp][LANES];
+  float m[kAttnRowsPerWarp], s[kAttnRowsPerWarp];
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
-    dot *= scale;
-    const float mn = fmaxf(m, dot);
-    const float alpha = (m > -1e29f) ? expf(m - mn) : 0.f;
-    const float p = expf(dot - mn);
-    s = s * alpha + p;
-    const float* vrow = v + static_cast<std::int64_t>(b) * v_batch + static_cast<std::int64_t>(j) * v_rows;
-    for (int i = 0; i < nlanes; ++i) oacc[i] = oacc[i] * alpha + p * vrow[lane + 32 * i];
-    m = mn;
+  for (int r = 0; r < kAttnRowsPerWarp; ++r) {
+    const bool valid = row0 + r < L;
+    const float* qrow = q + static_cast<std::int64_t>(b) * q_batch + static_cast<std::int64_t>(row0 + r) * q_rows;
+    m[r] = -1e30f;
+    s[r] = 0.f;
+#pragma unroll
+    for (int i = 0; i < LANES; ++i) {
+      qreg[r][i] = valid ? qrow[lane + 32 * i] : 0.f;
+      oacc[r][i] = 0.f;
+    }
   }
-  const float inv = 1.f / s;
-  float* orow = o + static_cast<std::int64_t>(b) * o_batch + static_cast<std::int64_t>(row) * D;
-  for (int i = 0; i < nlanes; ++i) orow[lane + 32 * i] = oacc[i] * inv;
+  const float* kbase = k + static_cast<std::int64_t>(b) * k_batch;
+  const float* vbase = v + static_cast<std::int64_t>(b) * v_batch;
+  float* ktile = smem;
+  float* vtile = smem + kAttnTile * kD;
+  for (int j0 = 0; j0 < L; j0 += kAttnTile) {
+    for (int idx = tid; idx < kAttnTile * kD; idx += kAttnWarps * 32) {
+      const int jj = idx / kD, d = idx % kD;
+      const int key = j0 + jj;
+      const bool valid = key < L;
+      ktile[idx] = valid ? kbase[static_cast<std::int64_t>(key) * k_rows + d] : 0.f;
+      vtile[idx] = valid ? vbase[static_cast<std::int64_t>(key) * v_rows + d] : 0.f;
+    }
+    __syncthreads();
+    const int jn = min(kAttnTile, L - j0);
+    for (int jj = 0; jj < jn; ++jj) {
+      const float* krow = ktile + jj * kD;
+      const float* vrow = vtile + jj * kD;
+#pragma unroll
+      for (int r = 0; r < kAttnRowsPerWarp; ++r) {
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < LANES; ++i) dot += qreg[r][i] * krow[lane + 32 * i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+        dot *= scale;
+        const float mn = fmaxf(m[r], dot);
+        const float alpha = (m[r] > -1e29f) ? expf(m[r] - mn) : 0.f;
+        const float p = expf(dot - mn);
+        s[r] = s[r] * alpha + p;
+#pragma unroll
+        for (int i = 0; i < LANES; ++i) oacc[r][i] = oacc[r][i] * alpha + p * vrow[lane + 32 * i];
+        m[r] = mn;
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int r = 0; r < kAttnRowsPerWarp; ++r) {
+    if (row0 + r >= L) continue;
+    const float inv = 1.f / s[r];
+    float* orow = o + static_cast<std::int64_t>(b) * o_batch + static_cast<std::int64_t>(row0 + r) * kD;
+    for (int i = 0; i < LANES; ++i) orow[lane + 32 * i] = oacc[r][i] * inv;
+  }
 }
-
 }  // namespace
 
 void vae_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual, const Tensor& y,
@@ -254,16 +294,72 @@ void vae_conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const
                                                           y.ptr<float>(), H, W, C, K, P, Q, kb_count);
   MI_CUDA_CHECK_LAUNCH();
 }
+// Generic fallback (any D that is a multiple of 32): one warp per query row, the lane holds D/32 elements. Slow at long
+// sequences, used only for head dimensions the register-tiled kernel does not instantiate (the checks' tiny shapes).
+__global__ void attention_f32_sm75_dyn(const float* __restrict__ q, const float* __restrict__ k,
+                                       const float* __restrict__ v, float* __restrict__ o, int L, int D, int q_rows,
+                                       int k_rows, int v_rows, std::int64_t q_batch, std::int64_t k_batch,
+                                       std::int64_t v_batch, std::int64_t o_batch, float scale) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int row = blockIdx.x * 4 + warp;
+  if (row >= L) return;
+  const int nlanes = D / 32;
+  const int b = blockIdx.y;
+  const float* qrow = q + static_cast<std::int64_t>(b) * q_batch + static_cast<std::int64_t>(row) * q_rows;
+  float qreg[16];
+  float oacc[16];
+  for (int i = 0; i < nlanes; ++i) {
+    qreg[i] = qrow[lane + 32 * i];
+    oacc[i] = 0.f;
+  }
+  float m = -1e30f, s = 0.f;
+  for (int j = 0; j < L; ++j) {
+    const float* krow = k + static_cast<std::int64_t>(b) * k_batch + static_cast<std::int64_t>(j) * k_rows;
+    float dot = 0.f;
+    for (int i = 0; i < nlanes; ++i) dot += qreg[i] * krow[lane + 32 * i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+    dot *= scale;
+    const float mn = fmaxf(m, dot);
+    const float alpha = (m > -1e29f) ? expf(m - mn) : 0.f;
+    const float p = expf(dot - mn);
+    s = s * alpha + p;
+    const float* vrow = v + static_cast<std::int64_t>(b) * v_batch + static_cast<std::int64_t>(j) * v_rows;
+    for (int i = 0; i < nlanes; ++i) oacc[i] = oacc[i] * alpha + p * vrow[lane + 32 * i];
+    m = mn;
+  }
+  const float inv = 1.f / s;
+  float* orow = o + static_cast<std::int64_t>(b) * o_batch + static_cast<std::int64_t>(row) * D;
+  for (int i = 0; i < nlanes; ++i) orow[lane + 32 * i] = oacc[i] * inv;
+}
+
 void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                         cudaStream_t stream) {
   const int L = static_cast<int>(q.dim(1)), D = static_cast<int>(q.dim(2));
   const int batch = static_cast<int>(q.dim(0));
-  const dim3 grid(static_cast<unsigned>((L + kAttnWarps - 1) / kAttnWarps), static_cast<unsigned>(batch));
-  attention_f32_sm75<<<grid, kAttnWarps * 32, 0, stream>>>(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(),
-                                                           o.ptr<float>(), L, D, static_cast<int>(q.stride[1]),
-                                                           static_cast<int>(k.stride[1]),
-                                                           static_cast<int>(v.stride[1]), q.stride[0], k.stride[0],
-                                                           v.stride[0], o.stride[0], scale);
+  const dim3 grid(static_cast<unsigned>((L + kAttnRows - 1) / kAttnRows), static_cast<unsigned>(batch));
+  const std::size_t smem = static_cast<std::size_t>(2) * kAttnTile * D * sizeof(float);
+  const auto launch = [&](auto* kernel) {
+    if (smem > 48 * 1024) {
+      MI_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(smem)));
+    }
+    kernel<<<grid, kAttnWarps * 32, smem, stream>>>(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(),
+                                                    o.ptr<float>(), L, static_cast<int>(q.stride[1]),
+                                                    static_cast<int>(k.stride[1]), static_cast<int>(v.stride[1]),
+                                                    q.stride[0], k.stride[0], v.stride[0], o.stride[0], scale);
+  };
+  if (D == 384) {
+    launch(&attention_f32_sm75_t<12>);
+  } else if (D == 512) {
+    launch(&attention_f32_sm75_t<16>);
+  } else {
+    const dim3 g(static_cast<unsigned>((L + 3) / 4), static_cast<unsigned>(batch));
+    attention_f32_sm75_dyn<<<g, 4 * 32, 0, stream>>>(q.ptr<float>(), k.ptr<float>(), v.ptr<float>(), o.ptr<float>(),
+                                                     L, D, static_cast<int>(q.stride[1]), static_cast<int>(k.stride[1]),
+                                                     static_cast<int>(v.stride[1]), q.stride[0], k.stride[0],
+                                                     v.stride[0], o.stride[0], scale);
+  }
   MI_CUDA_CHECK_LAUNCH();
 }
 
