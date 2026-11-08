@@ -34,16 +34,21 @@ Measured on the RTX 2080 8 GiB with the SFT bundle (`balanced`), this branch, af
 - Exact attention runs with every tier; the quantized tiers do not need 8-bit attention on sm_75.
 - `moss-infer quantize` runs on an 8 GiB Turing card: the 5B DiT became a 5.04 GB INT8 ConvRot file in 49 s
   (252 GEMMs quantized, 0 kept bf16).
+- `moss-infer quantize --format int4` (added for P1) writes the Turbo tier's `convrot_w4a4` format: 2.83 GB in 55 s
+  with `--recipe rtn`, 283 s with the default `--recipe mse` (its clipping-ratio search). Against a published community
+  `convrot_w4a4` file the quantized weights match at cosine 0.9993 (dequantized; the codes differ only by the 256-column
+  rotation GEMM's rounding), the bf16 tensors are bit-identical and the file loads and runs `tier turbo` on the RTX
+  2080 (0.16 s/step at 256^2, 3.9 GiB peak).
 - The VAE stays fp32 SIMT either way (see `docs/sm75.md`).
 
 ## Gaps
 
-**G1 - no INT4 writer.** `moss-infer quantize --format` accepts only `int8` and `nvfp4`
-(src/tools/cli/cmd_quantize.cpp). `convrot_w4a4` files (the only DiT format `turbo` accepts) therefore come from
-elsewhere. The pieces to write them exist: `src/weights/quant/convrot_w4a4.{h,cpp}` quantizes W4 with the ConvRot
-groups and `quant_group_size`, and the loader already reads the format. The file metadata is a
-`_quantization_metadata` JSON holding `format_version` and per-layer
-`{"format": "convrot_w4a4", "convrot_groupsize": 256, "quant_group_size": 64}` (checked in a community file).
+**G1 - INT4 writer (done, P1).** `moss-infer quantize --format int4` now writes the Turbo tier's `convrot_w4a4`
+format: packed W4 (`[N, K/2]`, even column the low nibble), a per-row f32 scale, 256-column rotation groups, and the
+file-level `_quantization_metadata` (`{"format_version": "1.0", "layers": {<module>: {"format": "convrot_w4a4",
+"convrot_groupsize": 256, "quant_group_size": 64}}}`). The scale rule is comfy-kitchen's clipping-ratio search
+(`--recipe mse`, the default) or absmax (`--recipe rtn`); LoRA merging and `--keep-bf16` work as for INT8. K must be a
+multiple of 256.
 
 **G2 - `high` with the bf16 bundle is refused on sm_75.** The tier is defined as INT8 GEMMs *plus* 8-bit attention;
 sm_75 has no 8-bit attention, so the resolver falls back to exact attention and then refuses the combination. A
@@ -64,11 +69,8 @@ one is loaded.
 
 ## Plan
 
-**P1 - INT4 output in `quantize` (small, independent).** Add `--format int4`: quantize each block GEMM with
-`weights::quant::convrot_w4a4`, write packed W4 weights plus the per-layer metadata above (group 256, quant group 64 by
-default, `--group` as for INT8), keep the non-block tensors bf16. Then `moss-infer generate --dit <int4> --tier turbo`
-works with a file produced on the same card. Test: the produced file's size (expected ~2.9 GB), `inspect`, a 256^2 and
-a 1024^2 generation, and compare its output with the community file's.
+**P1 - INT4 output in `quantize` (done).** `--format int4 --recipe mse|rtn` writes a `convrot_w4a4` DiT the same card
+can run with `--tier turbo`; the produced file is 2.83 GB and matches a published file's weights at cosine 0.9993.
 
 **P2 - Turing 8-bit attention (`q8_fp16`).** A new kernel in `src/kernels/sm75/`: INT8 QK with the Turing m8n8k16 MMA
 over the ConvRot-quantized q/k (the quantizers are already portable: `quant/rotate_quantize.cu`), fp16 P·V with the
