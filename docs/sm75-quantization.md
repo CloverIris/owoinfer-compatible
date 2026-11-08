@@ -79,6 +79,23 @@ existing m16n8k8 MMA, exact softmax in fp32. Wire it into `attention_supported`,
 `resolve_tier` so `--attention q8_fp16` is accepted on cc 7.5 and `high` with a bf16 DiT resolves to it. Expected:
 attention 14.3 ms -> 8-9 ms at 1024^2 (0.5 s per step saved) and `high` works without a quantized file.
 
+**P2 design notes (from the code, for the implementation).** The whole 8-bit path funnels through three functions in
+`src/kernels/attention_q8/attention_q8.cu` (`supported`, `attention_q8_workspace_bytes`, `attention_q8`), so a Turing
+implementation only has to answer those three for `kmInt8Fp16`/`kInt8Fp16F32Acc`; `moss_dit` and `resolve_tier` need no
+change beyond `supported()` turning true (tier `high` then picks `q8_fp16` on a bf16 DiT, because `kTierAttention` is
+`{q8_fp8, q8_fp16}` and picks the first supported one). Workspace on sm_75 should use its own layout:
+`q_i8 [total_q][heads][128]`, `k_i8 [total_k][kv][128]`, `v_f16`, `q_scale [total_q][heads]`, `k_scale [total_k][kv]`.
+The kernel can reuse the exact kernel's skeleton (`attention_sm75.cu`: 64-query CTA, 4 warps, 16 rows per warp, K/V
+tiles in shared, online softmax): only the score mainloop changes. Turing's INT8 MMA is `m8n8k16`
+(`mma.sync.aligned.m8n8k16.row.col.satfinite.s32.s8.s8.s32`, see `third_party/cutlass/include/cutlass/arch/mma_sm75.h`):
+A = 4 consecutive int8 per lane (row = lane/4, dims = 16*(chunk) + 4*(lane%4)), B = 4 consecutive int8 per lane
+(key = lane/4, same dims), C = 2 int32 per lane (row = lane/4, keys = 8*subtile + 2*(lane%4), +1). With two row groups
+per warp (rows r and r+8) this maps exactly onto the existing `s[t][0..3]` register block, so only the fragment loads,
+the mma and the dequantization (`s = acc * q_scale[row] * k_scale[key] * scale`) are new. `q` is quantized per row and
+`k` per row (SageAttention smooths K by its per-sequence mean; optional here); `v` becomes fp16 and the P·V path stays
+`m16n8k8`. The fused QK-norm/RoPE pre-pass of `attention_q8` is not worth porting: `dit_block_quant.cpp` already has a
+separate-kernel path (`fused_norm_rope` false, same bits), so the sm_75 q8 branch needs that condition forced off for
+Turing.
 **P3 - or, if P2 waits: a sm_75 tier rule.** Let `high` on cc 7.5 quantize the block GEMMs at load
 (`LoadOptions::int8_block_gemms` currently only follows an INT8 file) and keep exact attention, documented as a
 sm_75-specific definition of `high`. Small (planner + load options), but it changes what `high` means on Turing, so
