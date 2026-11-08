@@ -58,10 +58,11 @@ Turing user has to quantize the DiT first (or download an INT8 file) to use `hig
 is the mainline's long-sequence accelerator: at 1024^2 the DiT's exact attention is 1.05 s per step
 (7.3 TFLOPS with the new kernel), which an INT8 QK mainloop should roughly halve.
 
-**G4 - LoRA on quantized DiTs is unverified on sm_75.** Merged adapters on INT8 block GEMMs go through
-`merge_requantize_int8` (src/models/lora/lora_merge.cpp); on sm_75 every LoRA is merged (no side branches), and an
-INT4 DiT has no merge path at all, so `--tier turbo --lora` should refuse clearly instead of silently ignoring the
-adapter. Needs tests and, if missing, a message.
+**G4 - LoRA on quantized DiTs (done, P4).** On sm_75 every adapter is merged (the side branches are sm_80+ kernels).
+Verified on the RTX 2080: `reference + --lora` merges into bf16; `high + --lora` merges into the INT8 ConvRot weights
+through `merge_requantize_int8` and reports "merged into INT8 (requantization error)" per file; `turbo + --lora` is
+refused up front with a message naming the reason (INT4 ConvRot has no merge path; Turing has no side branches) and
+suggesting `tier high` or `tier reference`.
 
 **G5 - the app has to offer it.** MossStudio decides what to download and which tiers to show; a Turing card should be
 able to run `quantize` (engine CLI) or fetch INT8/INT4 files, and the tier selector should enable `high`/`turbo` when
@@ -83,9 +84,8 @@ attention 14.3 ms -> 8-9 ms at 1024^2 (0.5 s per step saved) and `high` works wi
 sm_75-specific definition of `high`. Small (planner + load options), but it changes what `high` means on Turing, so
 P2 is the cleaner long-term answer.
 
-**P4 - LoRA on quantized tiers.** Test `--tier high --lora` on sm_75 (merge + requantize), and make `--tier turbo
---lora` refuse with a message that names the missing merge path. If the requantize path turns out to need sm_80
-kernels, port the host merge (`quant::quantize_convrot_rows` is already used by the sm_80 path).
+**P4 - LoRA on quantized tiers (done).** `high + --lora` works on sm_75 (host requantize merge, warning as on sm_80);
+`turbo + --lora` refuses with the reason and the working alternatives.
 
 **P5 - docs and app.** Update `docs/sm75.md`'s limits with the outcome, add the INT4 production step and the measured
 tier table here, and tell MossStudio which files/tiers a cc 7.5 device can use.

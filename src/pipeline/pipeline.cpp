@@ -943,6 +943,14 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
     // failing. Keyed on the device, not on the kernels' availability: an sm_80+ build without them (MOSSINFER_ONLY)
     // still refuses, as before.
     const bool exact_when_no_q8 = kernels::sm75::turing();
+    // sm_75 has no LoRA side-branch kernels, so run() forces every adapter to merge (Pipeline::run, above); INT4
+    // ConvRot weights have no merge path (merges need bf16 or INT8 ConvRot), and the tier's own advice ("use
+    // lora_placement side_branch") does not exist on Turing: refuse here with what does work.
+    if (lora_requested && exact_when_no_q8 && src.precision == planner::Precision::kInt4) {
+      throw std::invalid_argument(
+          "runtime LoRAs cannot run on the turbo tier on sm_7x: its INT4 ConvRot weights have no merge path and Turing "
+          "has no LoRA side-branch kernels; use tier high (INT8 ConvRot) or tier reference");
+    }
     r.tier = planner::resolve_tier(m.options.tier, m.options.attention, src.precision, supported,
                                    tes.precision != qwen35_text::Precision::kBF16,
                                    src.precision == planner::Precision::kNvfp4 && kernels::nvfp4::available(),
