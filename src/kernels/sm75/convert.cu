@@ -113,7 +113,12 @@ __global__ void bf16_to_f16_rows_scaled(const __nv_bfloat16* __restrict__ src, _
   const __nv_bfloat16* s = src + static_cast<std::int64_t>(blockIdx.x) * src_stride;
   __half* d = dst + static_cast<std::int64_t>(blockIdx.x) * dst_stride;
   float amax = 0.f;
-  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(s[i])));
+  std::int64_t i = 2 * static_cast<std::int64_t>(threadIdx.x);
+  for (; i + 1 < cols; i += 2 * static_cast<std::int64_t>(blockDim.x)) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s + i));
+    amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y)));
+  }
+  for (; i < cols; i += blockDim.x) amax = fmaxf(amax, fabsf(__bfloat162float(s[i])));
   for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
   if (threadIdx.x % 32 == 0) warp_max[threadIdx.x / 32] = amax;
   __syncthreads();
@@ -128,9 +133,13 @@ __global__ void bf16_to_f16_rows_scaled(const __nv_bfloat16* __restrict__ src, _
   }
   __syncthreads();
   const float scale = row_scale;
-  for (std::int64_t i = threadIdx.x; i < cols; i += blockDim.x) d[i] = __float2half_rn(__bfloat162float(s[i]) * scale);
+  std::int64_t j = 2 * static_cast<std::int64_t>(threadIdx.x);
+  for (; j + 1 < cols; j += 2 * static_cast<std::int64_t>(blockDim.x)) {
+    const float2 f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(s + j));
+    *reinterpret_cast<__half2*>(d + j) = __floats2half2_rn(f.x * scale, f.y * scale);
+  }
+  for (; j < cols; j += blockDim.x) d[j] = __float2half_rn(__bfloat162float(s[j]) * scale);
 }
-
 // out[r][c] = out_type(acc[r][c] * inv_scale[r] + bias[c]): the fp32 add before the single final rounding.
 template <typename Out, typename Bias>
 __global__ void gemm_out_f32(const float* __restrict__ acc, const float* __restrict__ inv_scale, Out* __restrict__ out,
@@ -139,17 +148,36 @@ __global__ void gemm_out_f32(const float* __restrict__ acc, const float* __restr
   const float* a = acc + static_cast<std::int64_t>(blockIdx.x) * acc_stride;
   Out* o = out + static_cast<std::int64_t>(blockIdx.x) * out_stride;
   const float sc = inv_scale[blockIdx.x];
-  for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
-    float v = a[c] * sc;
-    if (bias != nullptr) v += static_cast<float>(bias[c]);
-    if constexpr (std::is_same_v<Out, float>) {
+  if constexpr (std::is_same_v<Out, float>) {
+    for (std::int64_t c = threadIdx.x; c < cols; c += blockDim.x) {
+      float v = a[c] * sc;
+      if (bias != nullptr) v += static_cast<float>(bias[c]);
       o[c] = v;
-    } else {
+    }
+  } else {
+    // Four columns per iteration: one float4 accumulator load and two packed bf16 stores.
+    std::int64_t c = 4 * static_cast<std::int64_t>(threadIdx.x);
+    for (; c + 3 < cols; c += 4 * static_cast<std::int64_t>(blockDim.x)) {
+      const float4 a4 = *reinterpret_cast<const float4*>(a + c);
+      float v0 = a4.x * sc, v1 = a4.y * sc, v2 = a4.z * sc, v3 = a4.w * sc;
+      if (bias != nullptr) {
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(bias + c));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(bias + c + 2));
+        v0 += b01.x;
+        v1 += b01.y;
+        v2 += b23.x;
+        v3 += b23.y;
+      }
+      *reinterpret_cast<__nv_bfloat162*>(o + c) = __floats2bfloat162_rn(v0, v1);
+      *reinterpret_cast<__nv_bfloat162*>(o + c + 2) = __floats2bfloat162_rn(v2, v3);
+    }
+    for (; c < cols; c += blockDim.x) {
+      float v = a[c] * sc;
+      if (bias != nullptr) v += static_cast<float>(bias[c]);
       o[c] = __float2bfloat16_rn(v);
     }
   }
 }
-
 }  // namespace
 
 void convert_rows_bf16_to_f16_scaled(void* dst, float* inv_scale, const void* src, std::int64_t rows,

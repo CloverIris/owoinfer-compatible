@@ -25,8 +25,8 @@ constexpr int kConvThreads = 128;
 __global__ void conv2d_f32_sm75(const float* __restrict__ x, const float* __restrict__ w,
                                 const float* __restrict__ bias, const float* __restrict__ residual,
                                 float* __restrict__ y, int H, int W, int C, int K, int R, int kb_count) {
-  __shared__ float xs[kPY * kPX * kTC];
-  __shared__ float ws[kTK * 9 * kTC];
+  __shared__ __align__(16) float xs[kPY * kPX * kTC];
+  __shared__ __align__(16) float ws[kTK * 9 * kTC];
   const int n = blockIdx.z / kb_count;
   const int kb = blockIdx.z % kb_count;
   const int ox0 = blockIdx.x * kTW, oy0 = blockIdx.y * kTH;
@@ -35,7 +35,9 @@ __global__ void conv2d_f32_sm75(const float* __restrict__ x, const float* __rest
   const int pixel = tid >> 1;      // 0..63
   const int cg = (tid & 1) * 16;   // first / second 16 output channels
   const int py = pixel / kTW, px = pixel % kTW;
-  float acc[16] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  float4 acc[16];
+#pragma unroll
+  for (int ch = 0; ch < 16; ++ch) acc[ch] = make_float4(0.f, 0.f, 0.f, 0.f);
 
   for (int c0 = 0; c0 < C; c0 += kTC) {
     for (int i = tid; i < kPY * kPX * kTC; i += kConvThreads) {
@@ -55,32 +57,76 @@ __global__ void conv2d_f32_sm75(const float* __restrict__ x, const float* __rest
                   : 0.f;
     }
     __syncthreads();
-    for (int cc = 0; cc < kTC; ++cc) {
-      if (c0 + cc >= C) break;
-      for (int r = 0; r < R; ++r) {
-        for (int s = 0; s < R; ++s) {
-          const float xv = xs[((py + r) * kPX + (px + s)) * kTC + cc];
+    // Four input channels at a time: one float4 shared load per (channel, tap) feeds four FMAs into the float4
+    // accumulator, which is four times fewer shared load and arithmetic instructions than the scalar loop.
+    const int taps = R * R;
+    for (int cc4 = 0; cc4 < kTC; cc4 += 4) {
+      if (c0 + cc4 + 3 < C) {
+        for (int r = 0; r < R; ++r) {
+          for (int s = 0; s < R; ++s) {
+            const float4 xv = *reinterpret_cast<const float4*>(&xs[((py + r) * kPX + (px + s)) * kTC + cc4]);
 #pragma unroll
-          for (int ch = 0; ch < 16; ++ch) acc[ch] += xv * ws[((cg + ch) * 9 + r * R + s) * kTC + cc];
+            for (int ch = 0; ch < 16; ++ch) {
+              const float4 wv = *reinterpret_cast<const float4*>(&ws[((cg + ch) * 9 + r * R + s) * kTC + cc4]);
+              acc[ch].x += xv.x * wv.x;
+              acc[ch].y += xv.y * wv.y;
+              acc[ch].z += xv.z * wv.z;
+              acc[ch].w += xv.w * wv.w;
+            }
+          }
+        }
+      } else {
+        for (int t = cc4; t < kTC && c0 + t < C; ++t) {
+          for (int r = 0; r < R; ++r) {
+            for (int s = 0; s < R; ++s) {
+              const float xv = xs[((py + r) * kPX + (px + s)) * kTC + t];
+              const float xw = xv;
+#pragma unroll
+              for (int ch = 0; ch < 16; ++ch) {
+                const float v = ws[((cg + ch) * 9 + r * R + s) * kTC + t];
+                acc[ch].x += xw * v;
+              }
+            }
+          }
         }
       }
     }
+    (void)taps;
     __syncthreads();
   }
 
+  float h[16];
+#pragma unroll
+  for (int ch = 0; ch < 16; ++ch) h[ch] = (acc[ch].x + acc[ch].y) + (acc[ch].z + acc[ch].w);
   const int ox = ox0 + px, oy = oy0 + py;
   if (ox >= W || oy >= H) return;
+  const std::int64_t out_base = ((static_cast<std::int64_t>(n) * H + oy) * W + ox) * K;
+  if ((K & 3) == 0 && kb * kTK + cg + 16 <= K) {
+    const int kch = kb * kTK + cg;
 #pragma unroll
-  for (int ch = 0; ch < 16; ++ch) {
-    const int kch = kb * kTK + cg + ch;
-    if (kch >= K) break;
-    const std::int64_t idx = ((static_cast<std::int64_t>(n) * H + oy) * W + ox) * K + kch;
-    float v = acc[ch] + bias[kch];
-    if (residual != nullptr) v += residual[idx];
-    y[idx] = v;
+    for (int ch = 0; ch < 16; ch += 4) {
+      const float4 b = *reinterpret_cast<const float4*>(&bias[kch + ch]);
+      float4 v = make_float4(h[ch] + b.x, h[ch + 1] + b.y, h[ch + 2] + b.z, h[ch + 3] + b.w);
+      if (residual != nullptr) {
+        const float4 r4 = *reinterpret_cast<const float4*>(&residual[out_base + kch + ch]);
+        v.x += r4.x;
+        v.y += r4.y;
+        v.z += r4.z;
+        v.w += r4.w;
+      }
+      *reinterpret_cast<float4*>(&y[out_base + kch + ch]) = v;
+    }
+  } else {
+#pragma unroll
+    for (int ch = 0; ch < 16; ++ch) {
+      const int kch = kb * kTK + cg + ch;
+      if (kch >= K) break;
+      float v = h[ch] + bias[kch];
+      if (residual != nullptr) v += residual[out_base + kch];
+      y[out_base + kch] = v;
+    }
   }
 }
-
 // ---------------------------------------------------------------- mid-block attention (single head, fp32)
 // One warp per query row: the lane holds D/32 elements of q, v and the output; the score is a warp reduction and the
 // softmax runs online, so the L x L matrix never exists. D is a multiple of 32 (384 or 512).
