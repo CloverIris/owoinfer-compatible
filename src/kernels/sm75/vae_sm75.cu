@@ -138,6 +138,76 @@ void vae_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tens
   MI_CUDA_CHECK_LAUNCH();
 }
 
+
+// ---------------------------------------------------------------- stride-2 downsample conv (VAE encoder)
+// Same layout as conv2d_f32_sm75 (one block: an 8x8 output tile of 32 output channels, input channels in groups of 8),
+// with the encoder's Downsample2D semantics: out[i,j] accumulates the 3x3 window at (2i, 2j) of the input, treating the
+// input as zero outside [0,H) x [0,W) (the reference pads one row/column at the bottom/right, nothing at the top/left).
+constexpr int kDownTW = 8, kDownTH = 8, kDownTC = 8;
+constexpr int kDownPX = kDownTW * 2 + 2;  // 18
+constexpr int kDownPY = kDownTH * 2 + 2;
+
+__global__ void conv2d_down_f32_sm75(const float* __restrict__ x, const float* __restrict__ w,
+                                     const float* __restrict__ bias, float* __restrict__ y, int H, int W, int C, int K,
+                                     int P, int Q, int kb_count) {
+  __shared__ float xs[kDownPY * kDownPX * kDownTC];
+  __shared__ float ws[kTK * 9 * kDownTC];
+  const int n = blockIdx.z / kb_count;
+  const int kb = blockIdx.z % kb_count;
+  const int ox0 = blockIdx.x * kDownTW, oy0 = blockIdx.y * kDownTH;
+  const int tid = threadIdx.x;
+  const int pixel = tid >> 1;
+  const int cg = (tid & 1) * 16;
+  const int py = pixel / kDownTW, px = pixel % kDownTW;
+  float acc[16] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+  for (int c0 = 0; c0 < C; c0 += kDownTC) {
+    for (int i = tid; i < kDownPY * kDownPX * kDownTC; i += kConvThreads) {
+      const int cc = i % kDownTC, p = i / kDownTC;
+      const int yy = p / kDownPX, xx = p % kDownPX;
+      const int gy = oy0 * 2 + yy, gx = ox0 * 2 + xx, gc = c0 + cc;
+      xs[i] = (gy < H && gx < W && gc < C) ? x[((static_cast<std::int64_t>(n) * H + gy) * W + gx) * C + gc] : 0.f;
+    }
+    for (int i = tid; i < kTK * 9 * kDownTC; i += kConvThreads) {
+      const int cc = i % kDownTC, t = i / kDownTC, rs = t % 9, kk = t / 9;
+      const int kch = kb * kTK + kk, gc = c0 + cc;
+      ws[i] = (kch < K && gc < C) ? w[(static_cast<std::int64_t>(kch) * 3 + rs / 3) * 3 * C + (rs % 3) * C + gc] : 0.f;
+    }
+    __syncthreads();
+    for (int cc = 0; cc < kDownTC; ++cc) {
+      if (c0 + cc >= C) break;
+      for (int r = 0; r < 3; ++r) {
+        for (int s = 0; s < 3; ++s) {
+          const float xv = xs[((py * 2 + r) * kDownPX + (px * 2 + s)) * kDownTC + cc];
+#pragma unroll
+          for (int ch = 0; ch < 16; ++ch) acc[ch] += xv * ws[((cg + ch) * 9 + r * 3 + s) * kDownTC + cc];
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  const int ox = ox0 + px, oy = oy0 + py;
+  if (ox >= Q || oy >= P) return;
+#pragma unroll
+  for (int ch = 0; ch < 16; ++ch) {
+    const int kch = kb * kTK + cg + ch;
+    if (kch >= K) break;
+    const std::int64_t idx = ((static_cast<std::int64_t>(n) * P + oy) * Q + ox) * K + kch;
+    y[idx] = acc[ch] + bias[kch];
+  }
+}
+void vae_conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor& y, cudaStream_t stream) {
+  const int H = static_cast<int>(x.dim(1)), W = static_cast<int>(x.dim(2)), C = static_cast<int>(x.dim(3));
+  const int K = static_cast<int>(w.dim(0));
+  const int P = static_cast<int>(y.dim(1)), Q = static_cast<int>(y.dim(2));
+  const int kb_count = (K + kTK - 1) / kTK;
+  const dim3 grid(static_cast<unsigned>((Q + kDownTW - 1) / kDownTW), static_cast<unsigned>((P + kDownTH - 1) / kDownTH),
+                  static_cast<unsigned>(x.dim(0) * kb_count));
+  conv2d_down_f32_sm75<<<grid, kConvThreads, 0, stream>>>(x.ptr<float>(), w.ptr<float>(), bias.ptr<float>(),
+                                                          y.ptr<float>(), H, W, C, K, P, Q, kb_count);
+  MI_CUDA_CHECK_LAUNCH();
+}
 void vae_attention_fp32(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& o, float scale,
                         cudaStream_t stream) {
   const int L = static_cast<int>(q.dim(1)), D = static_cast<int>(q.dim(2));

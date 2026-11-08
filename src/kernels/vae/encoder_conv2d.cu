@@ -11,6 +11,7 @@
 #include <type_traits>
 
 #include "core/cuda_check.h"
+#include "kernels/sm75/sm75.h"
 #include "kernels/vae/encoder_kernels.h"
 
 #include "cutlass/conv/conv2d_problem_size.h"
@@ -163,6 +164,7 @@ void run(const char* name, const Shape& s, const Tensor& x, const Tensor& w, con
 }  // namespace
 
 std::size_t encoder_conv2d_workspace_bytes(const Tensor& x, const Tensor& w, ConvMath math) {
+  if (kernels::sm75::turing()) return 0;  // the fp32 SIMT path keeps no workspace
   if (math == ConvMath::kTf32) return conv2d_workspace_bytes(x, w);
   const Tensor y = Tensor::view(nullptr, DType::kF32, Device::kCUDA, {x.dim(0), x.dim(1), x.dim(2), w.dim(0)});
   return workspace_for<SameX3>(check("encoder_conv2d", x, w, y, 1), x, w, y);
@@ -170,6 +172,11 @@ std::size_t encoder_conv2d_workspace_bytes(const Tensor& x, const Tensor& w, Con
 
 void encoder_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor* residual, const Tensor& y,
                     void* workspace, std::size_t workspace_bytes, ConvMath math, cudaStream_t stream) {
+  if (kernels::sm75::turing()) {  // fp32 SIMT conv: Turing has no tensor cores for this path
+    check("encoder_conv2d", x, w, y, 1);
+    kernels::sm75::vae_conv2d(x, w, bias, residual, y, stream);
+    return;
+  }
   if (math == ConvMath::kTf32) {
     conv2d(x, w, bias, residual, y, workspace, workspace_bytes, stream);
     return;
@@ -179,12 +186,18 @@ void encoder_conv2d(const Tensor& x, const Tensor& w, const Tensor& bias, const 
 }
 
 std::size_t conv2d_down_workspace_bytes(const Tensor& x, const Tensor& w, const Tensor& y, ConvMath math) {
+  if (kernels::sm75::turing()) return 0;
   const Shape s = check("conv2d_down", x, w, y, 2);
   return math == ConvMath::kTf32 ? workspace_for<DownTf32>(s, x, w, y) : workspace_for<DownX3>(s, x, w, y);
 }
 
 void conv2d_down(const Tensor& x, const Tensor& w, const Tensor& bias, const Tensor& y, void* workspace,
                  std::size_t workspace_bytes, ConvMath math, cudaStream_t stream) {
+  if (kernels::sm75::turing()) {
+    check("conv2d_down", x, w, y, 2);
+    kernels::sm75::vae_conv2d_down(x, w, bias, y, stream);
+    return;
+  }
   const Shape s = check("conv2d_down", x, w, y, 2);
   if (math == ConvMath::kTf32)
     run<DownTf32>("conv2d_down", s, x, w, bias, nullptr, y, workspace, workspace_bytes, stream);

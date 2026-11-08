@@ -1063,7 +1063,12 @@ Pipeline::Impl::CallModels Pipeline::Impl::setup_models(const Request& req, Resu
         // Merged adapters: re-merged from the pristine weights kept at load, in place (no reload).
         // A model merged without pristine copies (an edit adapter's blocks) is reloaded instead (its key cleared).
         if (m.dit && m.dit_merge_key == files && !m.dit->can_remerge()) m.dit_merge_key.clear();
-        if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
+        if (kernels::sm75::turing() && !m.lora_stack->merge_modules().empty()) {
+          // The merge is in bf16 at load, and the weights are converted to fp16 afterwards: re-merging in place would
+          // mix the two, so drop the DiT and let the next call reload (its load re-merges, then re-converts).
+          m.dit_merge_key.clear();
+          m.dit.reset();
+        } else if (m.dit && m.dit_merge_key == files && !m.lora_stack->merge_modules().empty()) {
           const auto t0m = Clock::now();
           try {
             m.dit->remerge_lora(*m.lora_stack);
@@ -1500,36 +1505,28 @@ void Pipeline::Impl::explain_control(const Request::Control& control, Result& r)
                         "): " + (inputs.empty() ? std::string("no images (zero control latents)") : inputs) + ".";
 }
 
-// Two features still need sm_80+ kernels and are refused on Turing before anything is planned, read or uploaded (by
-// Pipeline::run, and by a Session for its options and every run's spec): the VAE encoder's convolutions (img2img,
-// inpainting, reference images, and the hires fix, whose second pass encodes the upscaled image) and the LoRA GEMMs
-// (runtime LoRAs, and control adapters, which carry a LoRA). The message names the reason and what does work, instead
-// of failing at a missing kernel image mid-request.
+// Features that still need sm_80+ kernels are refused on Turing before anything is planned, read or uploaded (by
+// Pipeline::run, and by a Session for its options and every run's spec): control adapters (a LoRA with a replacement
+// embedding, fused into the block GEMMs). The VAE encoder runs on Turing (fp32 SIMT), and runtime LoRAs are merged at
+// load (Pipeline::run sets the placement).
 void detail::refuse_unsupported_on_sm7x(const Request& req) {
   if (!kernels::sm75::turing()) return;
-  if (req.init_image != nullptr) {
-    throw NotSupportedError("img2img and inpainting encode the input with the VAE encoder, which has no sm_7x kernel "
-                            "in this build; text-to-image works");
-  }
-  if (req.hires.enabled()) {
-    throw NotSupportedError("the hires fix encodes the upscaled image with the VAE encoder, which has no sm_7x kernel "
-                            "in this build; text-to-image without it works");
-  }
-  if (req.references.enabled()) {
-    throw NotSupportedError("reference images are encoded with the VAE encoder, which has no sm_7x kernel in this "
-                            "build; text-to-image without them works");
-  }
-  if (!req.loras.empty()) {
-    throw NotSupportedError("runtime LoRAs need sm_80+ GEMM kernels; this sm_7x build cannot apply them");
-  }
+  // The VAE encoder runs on Turing (fp32 SIMT convs, the same kernels as the decoder), so img2img, inpainting,
+  // reference images and the hires fix all work. Runtime LoRAs are merged into the weights instead of the sm_80+ fused
+  // side branches (Pipeline::run sets the placement); control adapters still need the fused LoRA path.
   if (req.control.enabled()) {
     throw NotSupportedError("control adapters are LoRAs and need sm_80+ GEMM kernels; this sm_7x build cannot run them");
   }
 }
-
 // generate(), or with `preload` the same up to the plan and the arena, then the loads of the models the plan keeps.
-Result Pipeline::run(const Request& req, const GenerateControl& control, bool preload) {
+Result Pipeline::run(const Request& request, const GenerateControl& control, bool preload) {
   Impl& m = *impl_;
+  Request req = request;
+  // Turing has no fused LoRA side-branch kernels (sm_80+ CUTLASS), so a runtime LoRA is merged into the weights at
+  // load instead (its load-time merge then feeds the fp16 conversion the same way as the bf16 bundle).
+  if (kernels::sm75::turing() && !req.loras.empty() && req.lora_placement != lora::Placement::kMerge) {
+    req.lora_placement = lora::Placement::kMerge;
+  }
   check_user_paths(m.options, req);
   validate(req);
   refuse_unsupported_on_sm7x(req);
